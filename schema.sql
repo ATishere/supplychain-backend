@@ -93,7 +93,7 @@ CREATE TABLE orders (
     PaymentMethod   VARCHAR(30)     DEFAULT 'Tiền mặt',
     CHECK (Bill >= 0),
     CHECK (Quantity > 0),
-    CHECK (Status IN ('Pending', 'Accepted', 'Rejected')),
+    CHECK (Status IN ('Pending', 'Accepted', 'Rejected', 'Cancelled')),
     CHECK (VatRate >= 0 AND VatRate <= 100),
     FOREIGN KEY (CustomerID) REFERENCES customer(CustomerID)
         ON DELETE CASCADE ON UPDATE CASCADE,

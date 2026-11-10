@@ -637,30 +637,63 @@ def add_customer():
 @app.route('/api/customers/<cid>', methods=['PUT'])
 @limiter.limit("10 per minute")
 def update_customer(cid):
-    err = admin_required()
-    if err: return err
+    claims = get_jwt()
+    role = claims.get("role")
     d = request.get_json(silent=True) or {}
-    clean, err_msg = extract_whitelisted_fields(d, CUSTOMER_ALLOWED_UPDATE)
-    if err_msg:
-        return jsonify({'error': err_msg, 'code': 400}), 400
-    if 'CustomerID' in clean and clean['CustomerID'] != cid:
-        return jsonify({'error': 'Không được phép thay đổi mã CustomerID', 'code': 400}), 400
-    for req_field in ('CustomerName', 'ContactNumber', 'Address'):
-        if not clean.get(req_field):
-            return jsonify({'error': f'Thiếu trường bắt buộc: {req_field}', 'code': 400}), 400
 
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM customer WHERE CustomerID=%s", (cid,))
-    if not cursor.fetchone():
-        cursor.close(); conn.close()
-        return jsonify({'error': 'Không tìm thấy khách hàng', 'code': 404}), 404
-    cursor.execute("""
-        UPDATE customer SET CustomerName=%s, ContactNumber=%s, Address=%s, TaxCode=%s, CustomerType=%s
-        WHERE CustomerID=%s
-    """, (clean['CustomerName'], clean['ContactNumber'], clean['Address'], clean.get('TaxCode'), clean.get('CustomerType', 'Individual'), cid))
-    conn.commit(); cursor.close(); conn.close()
-    return jsonify({'message': 'Customer updated'})
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT * FROM customer WHERE CustomerID=%s", (cid,))
+        current = cursor.fetchone()
+        if not current:
+            return jsonify({'error': 'Không tìm thấy khách hàng', 'code': 404}), 404
+
+        if role == "admin":
+            clean, err_msg = extract_whitelisted_fields(d, CUSTOMER_ALLOWED_UPDATE)
+            if err_msg:
+                return jsonify({'error': err_msg, 'code': 400}), 400
+            if 'CustomerID' in clean and clean['CustomerID'] != cid:
+                return jsonify({'error': 'Không được phép thay đổi mã CustomerID', 'code': 400}), 400
+            for req_field in ('CustomerName', 'ContactNumber', 'Address'):
+                if not clean.get(req_field):
+                    return jsonify({'error': f'Thiếu trường bắt buộc: {req_field}', 'code': 400}), 400
+            customer_name = clean['CustomerName']
+            contact_number = clean['ContactNumber']
+            address = clean['Address']
+            tax_code = clean.get('TaxCode')
+            customer_type = clean.get('CustomerType', 'Individual')
+            if customer_type not in ('Business', 'Individual'):
+                return jsonify({'error': 'CustomerType không hợp lệ', 'code': 400}), 400
+        else:
+            # Khách hàng chỉ được tự sửa SĐT và Địa chỉ của chính mình
+            if not claims.get('customer_id') or claims.get('customer_id') != cid:
+                return jsonify({'error': 'Forbidden: Không có quyền sửa hồ sơ khách hàng khác', 'code': 403}), 403
+            clean, err_msg = extract_whitelisted_fields(d, {'ContactNumber', 'Address'})
+            if err_msg:
+                return jsonify({'error': err_msg, 'code': 400}), 400
+            for req_field in ('ContactNumber', 'Address'):
+                if not str(clean.get(req_field) or '').strip():
+                    return jsonify({'error': f'Thiếu trường bắt buộc: {req_field}', 'code': 400}), 400
+            customer_name = current['CustomerName']
+            contact_number = clean['ContactNumber']
+            address = clean['Address']
+            tax_code = current.get('TaxCode')
+            customer_type = current.get('CustomerType', 'Individual')
+
+        cursor.execute("""
+            UPDATE customer SET CustomerName=%s, ContactNumber=%s, Address=%s, TaxCode=%s, CustomerType=%s
+            WHERE CustomerID=%s
+        """, (customer_name, contact_number, address, tax_code, customer_type, cid))
+        conn.commit()
+        return jsonify({'message': 'Customer updated'})
+    except Exception as e:
+        conn.rollback()
+        app.logger.error("CUSTOMER UPDATE FAILED | CustomerID=%s | %s: %s", cid, type(e).__name__, e, exc_info=True)
+        raise
+    finally:
+        cursor.close()
+        conn.close()
 
 @app.route('/api/customers/<cid>', methods=['DELETE'])
 @limiter.limit("10 per minute")
@@ -726,18 +759,27 @@ def add_order():
         if not cid:
             return jsonify({'error': 'Forbidden: Yêu cầu đăng nhập tài khoản khách hàng', 'code': 403}), 403
         customer_id = cid
-        # Bắt buộc gán cứng Status = 'Pending' đối với customer — tuyệt đối không tin tưởng Status từ client
+        # Khách hàng không được tự đặt Status/Invoice/VAT — server ép giá trị an toàn
         order_status = 'Pending'
+        invoice_number = None
+        vat_rate = 10
     else:
         customer_id = clean.get('CustomerID')
         if not customer_id:
             return jsonify({'error': 'Thiếu mã khách hàng', 'code': 400}), 400
-        order_status = clean.get('Status', 'Pending')
-        if order_status not in ('Pending', 'Accepted', 'Rejected'):
+        order_status = clean.get('Status') or 'Pending'
+        if order_status not in ('Pending', 'Accepted', 'Rejected', 'Cancelled'):
             order_status = 'Pending'
+        invoice_number = clean.get('InvoiceNumber')
+        try:
+            vat_rate = float(clean.get('VatRate') if clean.get('VatRate') is not None else 10)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'VatRate không hợp lệ', 'code': 400}), 400
+        if vat_rate < 0 or vat_rate > 100:
+            return jsonify({'error': 'VatRate phải trong khoảng 0-100', 'code': 400}), 400
 
     try:
-        qty = int(clean.get('Quantity', 1) or 1)
+        qty = int(clean.get('Quantity') or 1)
     except (TypeError, ValueError):
         return jsonify({'error': 'Số lượng không hợp lệ', 'code': 400}), 400
     if qty < 1:
@@ -745,35 +787,49 @@ def add_order():
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT UnitPrice FROM product WHERE ProductID=%s", (clean['ProductID'],))
-    prod = cursor.fetchone()
-    if not prod:
-        cursor.close(); conn.close()
-        return jsonify({'error': 'Sản phẩm không tồn tại', 'code': 400}), 400
+    try:
+        cursor.execute("SELECT UnitPrice FROM product WHERE ProductID=%s", (clean['ProductID'],))
+        prod = cursor.fetchone()
+        if not prod:
+            return jsonify({'error': 'Sản phẩm không tồn tại', 'code': 400}), 400
 
-    # Calculate or validate bill securely
-    if role != "admin":
-        # Customer cannot tamper with Bill — calculated server-side from catalog price
-        bill = round(float(prod['UnitPrice']) * qty, 2)
-    else:
-        try:
-            bill = float(clean.get('Bill') if clean.get('Bill') is not None else float(prod['UnitPrice']) * qty)
-        except (TypeError, ValueError):
-            cursor.close(); conn.close()
-            return jsonify({'error': 'Bill không hợp lệ', 'code': 400}), 400
-        if bill < 0:
-            cursor.close(); conn.close()
-            return jsonify({'error': 'Bill không được âm', 'code': 400}), 400
+        # Calculate or validate bill securely
+        if role != "admin":
+            # Customer cannot tamper with Bill — calculated server-side from catalog price
+            bill = round(float(prod['UnitPrice']) * qty, 2)
+        else:
+            try:
+                bill = float(clean.get('Bill') if clean.get('Bill') is not None else float(prod['UnitPrice']) * qty)
+            except (TypeError, ValueError):
+                return jsonify({'error': 'Bill không hợp lệ', 'code': 400}), 400
+            if bill < 0:
+                return jsonify({'error': 'Bill không được âm', 'code': 400}), 400
 
-    vat_rate = clean.get('VatRate', 10)
-    vat_amount = clean.get('VatAmount', round(bill * vat_rate / 100))
+        # VatAmount luôn được tính ở server, không tin giá trị từ client
+        vat_amount = round(bill * vat_rate / 100, 2)
 
-    cursor.execute("""
-        INSERT INTO orders (OrderID, OrderDate, Bill, CustomerID, ProductID, Quantity, Status, InvoiceNumber, VatRate, VatAmount, PaymentMethod)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (clean['OrderID'], clean['OrderDate'], bill, customer_id, clean['ProductID'], qty, order_status, clean.get('InvoiceNumber'), vat_rate, vat_amount, clean.get('PaymentMethod', 'Tiền mặt')))
-    conn.commit(); cursor.close(); conn.close()
-    return jsonify({'message': 'Order added'}), 201
+        cursor.execute("""
+            INSERT INTO orders (OrderID, OrderDate, Bill, CustomerID, ProductID, Quantity, Status, InvoiceNumber, VatRate, VatAmount, PaymentMethod)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (clean['OrderID'], clean['OrderDate'], bill, customer_id, clean['ProductID'], qty, order_status, invoice_number, vat_rate, vat_amount, clean.get('PaymentMethod') or 'Tiền mặt'))
+        conn.commit()
+        return jsonify({'message': 'Order added'}), 201
+    except Exception as e:
+        conn.rollback()
+        app.logger.error(
+            "ORDER INSERT FAILED | OrderID=%s | CustomerID=%s | ProductID=%s | Quantity=%s | Role=%s | %s: %s",
+            clean.get('OrderID'), customer_id, clean.get('ProductID'), qty, role, type(e).__name__, e,
+            exc_info=True
+        )
+        print(
+            f"[ORDER INSERT ERROR] OrderID={clean.get('OrderID')} CustomerID={customer_id} "
+            f"ProductID={clean.get('ProductID')} Quantity={qty} Role={role} -> {type(e).__name__}: {e}",
+            flush=True
+        )
+        return jsonify({'error': 'Không thể tạo đơn hàng. Vui lòng kiểm tra dữ liệu hoặc thử lại.', 'code': 500}), 500
+    finally:
+        cursor.close()
+        conn.close()
 
 @app.route('/api/orders/<oid>', methods=['PUT'])
 @limiter.limit("10 per minute")
@@ -866,8 +922,9 @@ def delete_order(oid):
 @app.route('/api/orders/<oid>/status', methods=['PATCH'])
 @limiter.limit("10 per minute")
 def update_order_status(oid):
-    err = admin_required()
-    if err: return err
+    claims = get_jwt()
+    role = claims.get("role")
+    cid = claims.get("customer_id")
     d = request.get_json(silent=True) or {}
 
     # Mass Assignment Whitelist check for PATCH
@@ -880,8 +937,12 @@ def update_order_status(oid):
         }), 400
 
     new_status = d.get('Status')
-    if new_status not in ('Accepted', 'Pending', 'Rejected'):
-        return jsonify({'error': 'Trạng thái không hợp lệ (Pending/Accepted/Rejected)', 'code': 400}), 400
+    if new_status not in ('Accepted', 'Pending', 'Rejected', 'Cancelled'):
+        return jsonify({'error': 'Trạng thái không hợp lệ (Pending/Accepted/Rejected/Cancelled)', 'code': 400}), 400
+
+    # Phân quyền: khách hàng chỉ được hủy đơn của chính mình
+    if role != "admin" and new_status != "Cancelled":
+        return jsonify({'error': 'Forbidden: Khách hàng chỉ có thể hủy đơn hàng', 'code': 403}), 403
 
     conn = get_connection()
     cursor = None
@@ -891,16 +952,25 @@ def update_order_status(oid):
         cursor = conn.cursor(dictionary=True)
 
         # Row-level locking on the target order
-        cursor.execute("SELECT ProductID, Status, Quantity FROM orders WHERE OrderID=%s FOR UPDATE", (oid,))
+        cursor.execute("SELECT ProductID, CustomerID, Status, Quantity FROM orders WHERE OrderID=%s FOR UPDATE", (oid,))
         order = cursor.fetchone()
         if not order:
             conn.rollback()
             return jsonify({'error': 'Không tìm thấy đơn hàng', 'code': 404}), 404
 
-        # Idempotent check: if already Accepted and requested Accepted again, do not re-deduct
-        if new_status == 'Accepted' and order['Status'] == 'Accepted':
+        if role != "admin" and (not cid or order.get('CustomerID') != cid):
+            conn.rollback()
+            return jsonify({'error': 'Forbidden: Không có quyền thao tác trên đơn hàng này', 'code': 403}), 403
+
+        # Idempotent check: trạng thái đã đúng yêu cầu thì không xử lý lại
+        if new_status == order['Status']:
             conn.commit()
-            return jsonify({'message': 'Đơn hàng đã được duyệt trước đó'})
+            return jsonify({'message': f'Đơn hàng đã ở trạng thái {new_status}'})
+
+        # Chỉ được hủy đơn đang chờ duyệt (chưa trừ tồn kho)
+        if new_status == 'Cancelled' and order['Status'] != 'Pending':
+            conn.rollback()
+            return jsonify({'error': 'Chỉ có thể hủy đơn hàng đang chờ duyệt (Pending)', 'code': 409}), 409
 
         # Chuyển sang Accepted: trừ đúng Quantity đơn vị tồn kho với Row-Level Locking (SELECT ... FOR UPDATE)
         if new_status == 'Accepted' and order['Status'] != 'Accepted':
