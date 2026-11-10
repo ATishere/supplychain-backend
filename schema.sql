@@ -26,7 +26,7 @@ CREATE TABLE product (
     ProductID       VARCHAR(10)     PRIMARY KEY,
     ProductName     VARCHAR(100)    NOT NULL,
     Category        VARCHAR(50),
-    UnitPrice       DECIMAL(10,2)   NOT NULL,
+    UnitPrice       DECIMAL(15,2)   NOT NULL,
     SupplierID      VARCHAR(10),
     Unit            VARCHAR(20)     DEFAULT 'Cái',
     Origin          VARCHAR(50)     DEFAULT 'Việt Nam',
@@ -82,7 +82,7 @@ CREATE TABLE customer (
 CREATE TABLE orders (
     OrderID         VARCHAR(10)     PRIMARY KEY,
     OrderDate       DATE            NOT NULL,
-    Bill            DECIMAL(10,2)   NOT NULL,
+    Bill            DECIMAL(15,2)   NOT NULL,
     CustomerID      VARCHAR(10)     NOT NULL,
     Status          VARCHAR(20)     DEFAULT 'Pending',
     ProductID       VARCHAR(10),
@@ -113,26 +113,32 @@ INSERT INTO supplier (SupplierID, SupplierName, ContactNumber, Location, TaxCode
 ('S005', 'Công ty TNHH Bao bì Sinh thái',         '0283456789', 'KCN VSIP, Bình Dương',           '0101234571', 'baobisinhthai@supplychain7vn.vn');
 
 INSERT INTO product (ProductID, ProductName, Category, UnitPrice, SupplierID, Unit, Origin) VALUES
-('P001', 'Động cơ công nghiệp A4',  'Máy móc',     12500.00, 'S002', 'Chiếc', 'Việt Nam'),
-('P002', 'Phân bón hữu cơ X',       'Nguyên liệu',   850.00, 'S001', 'Bao',   'Việt Nam'),
-('P003', 'Thùng carton cỡ L',       'Bao bì',         45.00, 'S005', 'Thùng', 'Việt Nam'),
-('P004', 'Bo mạch điều khiển PCB',  'Linh kiện',    3200.00, 'S004', 'Bộ',    'Nhật Bản'),
-('P005', 'Thanh thép 12mm',          'Nguyên liệu',   320.00, 'S002', 'Cây',   'Việt Nam'),
-('P006', 'Cuộn bọc bong bóng',       'Bao bì',        180.00, 'S003', 'Cuộn',  'Hàn Quốc');
+('P001', 'Động cơ công nghiệp A4',  'Máy móc',     12500000.00, 'S002', 'Chiếc', 'Việt Nam'),
+('P002', 'Phân bón hữu cơ X',       'Nguyên liệu',   850000.00, 'S001', 'Bao',   'Việt Nam'),
+('P003', 'Thùng carton cỡ L',       'Bao bì',         15000.00, 'S005', 'Thùng', 'Việt Nam'),
+('P004', 'Bo mạch điều khiển PCB',  'Linh kiện',    1500000.00, 'S004', 'Bộ',    'Nhật Bản'),
+('P005', 'Thanh thép 12mm',         'Nguyên liệu',   250000.00, 'S002', 'Cây',   'Việt Nam'),
+('P006', 'Cuộn bọc bong bóng',      'Bao bì',        120000.00, 'S003', 'Cuộn',  'Hàn Quốc');
 
 INSERT INTO warehouse (WarehouseID, WarehouseName, Location, Capacity, ProvinceCode) VALUES
-('W001', 'Kho trung tâm TP.HCM', 'Quận Bình Tân, TP. Hồ Chí Minh', 10000, 'HCM'),
-('W002', 'Kho Hà Nội',           'Quận Long Biên, Hà Nội',         15000, 'HN'),
-('W003', 'Kho cảng Hải Phòng',   'Quận Hải An, Hải Phòng',         20000, 'HP'),
-('W004', 'Kho Đà Nẵng',          'Quận Liên Chiểu, Đà Nẵng',        8000, 'DN');
+('W001', 'Kho trung tâm TP.HCM', 'Quận Bình Tân, TP. Hồ Chí Minh',  4000, 'HCM'),
+('W002', 'Kho Hà Nội',           'Quận Long Biên, Hà Nội',          3000, 'HN'),
+('W003', 'Kho cảng Hải Phòng',   'Quận Hải An, Hải Phòng',         12000, 'HP'),
+('W004', 'Kho Đà Nẵng',          'Quận Liên Chiểu, Đà Nẵng',        1500, 'DN');
 
 INSERT INTO inventory (InventoryID, QuantityAvailable, ProductID, WarehouseID) VALUES
-('I001', 142,  'P001', 'W001'),
-('I002',  23,  'P002', 'W002'),
-('I003', 5400, 'P003', 'W003'),
-('I004',  67,  'P004', 'W001'),
-('I005', 890,  'P005', 'W004'),
-('I006', 210,  'P006', 'W003');
+('I001',  120, 'P001', 'W001'),
+('I002', 1200, 'P002', 'W002'),
+('I003', 8000, 'P003', 'W003'),
+('I004',  350, 'P004', 'W001'),
+('I005',  500, 'P005', 'W004'),
+('I006',  800, 'P006', 'W003'),
+('I007',   40, 'P001', 'W002'),  -- dưới ngưỡng 50: cảnh báo tồn kho thấp
+('I008',  300, 'P002', 'W004'),
+('I009', 1500, 'P003', 'W001'),
+('I010',  150, 'P004', 'W002'),
+('I011',  200, 'P005', 'W001'),
+('I012',  250, 'P006', 'W002');
 
 INSERT INTO customer (CustomerID, CustomerName, ContactNumber, Address, TaxCode, CustomerType) VALUES
 ('C001', 'Nguyễn Văn An',  '0912345678', '12 Lê Lợi, Quận 1, TP. Hồ Chí Minh', '0301234567', 'Business'),
@@ -141,15 +147,25 @@ INSERT INTO customer (CustomerID, CustomerName, ContactNumber, Address, TaxCode,
 ('C004', 'Phạm Thị Dung',  '0938123456', '23 Hai Bà Trưng, TP. Hồ Chí Minh',    '0301234569', 'Business'),
 ('C005', 'Hoàng Văn Em',   '0912345679', '56 Lý Thường Kiệt, Cần Thơ',         NULL,         'Individual');
 
--- OrderDate = 2026; Bill = UnitPrice x Quantity (khớp form tự tính); Trạng thái
--- dùng đúng 3 giá trị hợp lệ của CHECK: Pending / Accepted / Rejected.
+-- Quy ước tính tiền (khớp backend/app.py và InvoiceModal):
+--   Bill      = UnitPrice × Quantity       -> tạm tính TRƯỚC VAT
+--   VatAmount = Bill × VatRate / 100       -> thuế GTGT
+--   Tổng thanh toán hóa đơn = Bill + VatAmount
+-- Phân bón (P002) áp dụng VAT 0% theo quy định miễn thuế GTGT của Việt Nam.
+-- InvoiceNumber chỉ cấp cho đơn Accepted; Pending/Rejected để NULL.
 INSERT INTO orders (OrderID, OrderDate, Bill, CustomerID, ProductID, Quantity, Status, InvoiceNumber, VatRate, VatAmount, PaymentMethod) VALUES
-('ORD001', '2026-01-15', 62500.00, 'C001', 'P001',   5, 'Accepted', 'HD-ORD001', 10.00,  6250.00, 'Chuyển khoản'),
-('ORD002', '2026-01-20', 17000.00, 'C002', 'P002',  20, 'Accepted', 'HD-ORD002', 10.00,  1700.00, 'Tiền mặt'),
-('ORD003', '2026-01-22', 32000.00, 'C003', 'P004',  10, 'Pending',  'HD-ORD003',  8.00,  2560.00, 'Chuyển khoản'),
-('ORD004', '2026-01-23',  4500.00, 'C004', 'P003', 100, 'Rejected', 'HD-ORD004',  5.00,   225.00, 'Tiền mặt'),
-('ORD005', '2026-01-25', 16000.00, 'C005', 'P005',  50, 'Accepted', 'HD-ORD005', 10.00,  1600.00, 'Ví điện tử'),
-('ORD006', '2026-01-28',  5400.00, 'C001', 'P006',  30, 'Pending',  'HD-ORD006', 10.00,   540.00, 'Chuyển khoản');
+('ORD001', '2026-01-15',  25000000.00, 'C001', 'P001',   2, 'Accepted', 'HD-ORD001', 10.00,  2500000.00, 'Chuyển khoản'),
+('ORD002', '2026-02-10',  85000000.00, 'C002', 'P002', 100, 'Accepted', 'HD-ORD002',  0.00,        0.00, 'Chuyển khoản'),
+('ORD003', '2026-03-18',  15000000.00, 'C003', 'P004',  10, 'Pending',  NULL,       10.00,  1500000.00, 'Chuyển khoản'),
+('ORD004', '2026-04-07',   1500000.00, 'C004', 'P003', 100, 'Rejected', NULL,       10.00,   150000.00, 'Tiền mặt'),
+('ORD005', '2026-05-22',  12500000.00, 'C005', 'P005',  50, 'Accepted', 'HD-ORD005', 10.00,  1250000.00, 'Ví điện tử'),
+('ORD006', '2026-06-30',   3600000.00, 'C001', 'P006',  30, 'Pending',  NULL,       10.00,   360000.00, 'Chuyển khoản'),
+('ORD007', '2026-07-14',   7500000.00, 'C002', 'P003', 500, 'Accepted', 'HD-ORD007', 10.00,   750000.00, 'Chuyển khoản'),
+('ORD008', '2026-08-05',  50000000.00, 'C003', 'P005', 200, 'Accepted', 'HD-ORD008', 10.00,  5000000.00, 'Chuyển khoản'),
+('ORD009', '2026-09-09',  37500000.00, 'C004', 'P004',  25, 'Accepted', 'HD-ORD009', 10.00,  3750000.00, 'Chuyển khoản'),
+('ORD010', '2026-10-21', 255000000.00, 'C005', 'P002', 300, 'Accepted', 'HD-ORD010',  0.00,        0.00, 'Chuyển khoản'),
+('ORD011', '2026-11-02',   7200000.00, 'C001', 'P006',  60, 'Pending',  NULL,       10.00,   720000.00, 'Ví điện tử'),
+('ORD012', '2026-11-06',  12500000.00, 'C002', 'P001',   1, 'Rejected', NULL,       10.00,  1250000.00, 'Chuyển khoản');
 
 -- ─────────────────────────────────────────────────────────────
 -- TABLE 7: user (JWT authentication)
@@ -173,3 +189,11 @@ INSERT INTO user (Username, PasswordHash, Role, CustomerID) VALUES
 ('C003',  '$2b$12$z7waJAK0QAundU1xdXEVBeF/GujKv8aW6v1nHVYz71CC6nd/xTTOe', 'customer', 'C003'),
 ('C004',  '$2b$12$z7waJAK0QAundU1xdXEVBeF/GujKv8aW6v1nHVYz71CC6nd/xTTOe', 'customer', 'C004'),
 ('C005',  '$2b$12$z7waJAK0QAundU1xdXEVBeF/GujKv8aW6v1nHVYz71CC6nd/xTTOe', 'customer', 'C005');
+
+-- ─────────────────────────────────────────────────────────────
+-- TABLE 8: token_blacklist (JWT Revocation / Blacklist)
+-- ─────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS token_blacklist (
+    jti         VARCHAR(64)     PRIMARY KEY,
+    RevokedAt   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP
+);
