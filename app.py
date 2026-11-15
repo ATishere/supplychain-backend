@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import date
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, verify_jwt_in_request, get_jwt
@@ -209,13 +210,57 @@ def next_order_id(cursor):
     cursor.execute("SELECT LAST_INSERT_ID() AS n")
     return "ORD%03d" % cursor.fetchone()["n"]
 
-SUPPLIER_ALLOWED_UPDATE  = {'SupplierName', 'ContactNumber', 'Location', 'TaxCode', 'Email', 'SupplierID'}
+def next_entity_id(cursor, entity, prefix):
+    """Sinh mã chứng từ tuần tự bằng row lock trên entity_id_sequence."""
+    cursor.execute(
+        "INSERT IGNORE INTO entity_id_sequence (entity, next_value) VALUES (%s, 0)",
+        (entity,),
+    )
+    cursor.execute(
+        "UPDATE entity_id_sequence SET next_value = LAST_INSERT_ID(next_value + 1) WHERE entity = %s",
+        (entity,),
+    )
+    cursor.execute("SELECT LAST_INSERT_ID() AS n")
+    return "%s%03d" % (prefix, int(cursor.fetchone()["n"]))
+
+def lock_inventory_for_product(cursor, product_id):
+    """Khóa dòng tồn kho ưu tiên kho W001, sau đó kho còn nhiều hàng nhất."""
+    cursor.execute(
+        """
+        SELECT InventoryID, QuantityAvailable, WarehouseID
+        FROM inventory
+        WHERE ProductID=%s
+        ORDER BY (WarehouseID='W001') DESC, QuantityAvailable DESC
+        FOR UPDATE
+        """,
+        (product_id,),
+    )
+    rows = cursor.fetchall()
+    return rows[0] if rows else None
+
+def write_inventory_adjustment(cursor, inventory_id, old_qty, new_qty, reason):
+    adjustment_id = next_entity_id(cursor, 'ADJ', 'ADJ')
+    cursor.execute(
+        """
+        INSERT INTO inventory_adjustments
+            (AdjustmentID, InventoryID, OldQuantity, NewQuantity, Reason)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (adjustment_id, inventory_id, old_qty, new_qty, reason),
+    )
+    return adjustment_id
+
+SUPPLIER_ALLOWED_UPDATE  = {'SupplierName', 'ContactNumber', 'Location', 'TaxCode', 'Email', 'Rating', 'OnTimeRate', 'SupplierID'}
 PRODUCT_ALLOWED_UPDATE   = {'ProductName', 'Category', 'UnitPrice', 'SupplierID', 'Unit', 'Origin', 'ProductID'}
 WAREHOUSE_ALLOWED_UPDATE = {'WarehouseName', 'Location', 'Capacity', 'ProvinceCode', 'WarehouseID'}
 INVENTORY_ALLOWED_UPDATE = {'QuantityAvailable', 'ProductID', 'WarehouseID', 'InventoryID'}
 CUSTOMER_ALLOWED_UPDATE  = {'CustomerName', 'ContactNumber', 'Address', 'TaxCode', 'CustomerType', 'CustomerID'}
 ORDER_ALLOWED_UPDATE     = {'OrderDate', 'Bill', 'CustomerID', 'ProductID', 'Quantity', 'InvoiceNumber', 'VatRate', 'VatAmount', 'PaymentMethod', 'OrderID'}
 ORDER_ALLOWED_CREATE     = {'OrderID', 'OrderDate', 'Bill', 'CustomerID', 'ProductID', 'Quantity', 'InvoiceNumber', 'VatRate', 'VatAmount', 'PaymentMethod', 'Status'}
+PR_ALLOWED_CREATE        = {'ProductID', 'Quantity', 'RequestedBy'}
+PO_ALLOWED_CREATE        = {'PRID', 'SupplierID', 'ProductID', 'Quantity', 'UnitPrice', 'OrderDate'}
+RETURN_ALLOWED_CREATE    = {'OriginalOrderID', 'Quantity', 'Reason'}
+ADJUST_REASONS           = {'Kiểm kê', 'Hàng hỏng', 'Nhập thêm', 'Xuất kho'}
 
 
 # ══════════════════════════════════════════════════════
@@ -325,13 +370,22 @@ def get_suppliers():
 def add_supplier():
     err = admin_required();
     if err: return err
-    d = request.json
+    d = request.get_json(silent=True) or {}
+    try:
+        rating = int(d.get('Rating', 5))
+        on_time_rate = float(d.get('OnTimeRate', 100))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Rating hoặc OnTimeRate không hợp lệ', 'code': 400}), 400
+    if rating < 1 or rating > 5:
+        return jsonify({'error': 'Rating phải trong khoảng 1-5', 'code': 400}), 400
+    if on_time_rate < 0 or on_time_rate > 100:
+        return jsonify({'error': 'OnTimeRate phải trong khoảng 0-100', 'code': 400}), 400
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO supplier (SupplierID, SupplierName, ContactNumber, Location, TaxCode, Email)
-        VALUES (%s, %s, %s, %s, %s, %s)
-    """, (d['SupplierID'], d['SupplierName'], d['ContactNumber'], d['Location'], d.get('TaxCode'), d.get('Email')))
+        INSERT INTO supplier (SupplierID, SupplierName, ContactNumber, Location, TaxCode, Email, Rating, OnTimeRate)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """, (d['SupplierID'], d['SupplierName'], d['ContactNumber'], d['Location'], d.get('TaxCode'), d.get('Email'), rating, on_time_rate))
     conn.commit(); cursor.close(); conn.close()
     return jsonify({'message': 'Supplier added'}), 201
 
@@ -351,15 +405,28 @@ def update_supplier(sid):
             return jsonify({'error': f'Thiếu trường bắt buộc: {req_field}', 'code': 400}), 400
 
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM supplier WHERE SupplierID=%s", (sid,))
-    if not cursor.fetchone():
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT Rating, OnTimeRate FROM supplier WHERE SupplierID=%s", (sid,))
+    existing = cursor.fetchone()
+    if not existing:
         cursor.close(); conn.close()
         return jsonify({'error': 'Không tìm thấy nhà cung cấp', 'code': 404}), 404
+    try:
+        rating = int(clean.get('Rating', existing['Rating']))
+        on_time_rate = float(clean.get('OnTimeRate', existing['OnTimeRate']))
+    except (TypeError, ValueError):
+        cursor.close(); conn.close()
+        return jsonify({'error': 'Rating hoặc OnTimeRate không hợp lệ', 'code': 400}), 400
+    if rating < 1 or rating > 5:
+        cursor.close(); conn.close()
+        return jsonify({'error': 'Rating phải trong khoảng 1-5', 'code': 400}), 400
+    if on_time_rate < 0 or on_time_rate > 100:
+        cursor.close(); conn.close()
+        return jsonify({'error': 'OnTimeRate phải trong khoảng 0-100', 'code': 400}), 400
     cursor.execute("""
-        UPDATE supplier SET SupplierName=%s, ContactNumber=%s, Location=%s, TaxCode=%s, Email=%s
+        UPDATE supplier SET SupplierName=%s, ContactNumber=%s, Location=%s, TaxCode=%s, Email=%s, Rating=%s, OnTimeRate=%s
         WHERE SupplierID=%s
-    """, (clean['SupplierName'], clean['ContactNumber'], clean['Location'], clean.get('TaxCode'), clean.get('Email'), sid))
+    """, (clean['SupplierName'], clean['ContactNumber'], clean['Location'], clean.get('TaxCode'), clean.get('Email'), rating, on_time_rate, sid))
     conn.commit(); cursor.close(); conn.close()
     return jsonify({'message': 'Supplier updated'})
 
@@ -623,6 +690,67 @@ def delete_inventory(iid):
         return jsonify({'error': 'Không tìm thấy bản ghi tồn kho', 'code': 404}), 404
     conn.commit(); cursor.close(); conn.close()
     return jsonify({'message': 'Inventory deleted'})
+
+@app.route('/api/inventory/adjust', methods=['POST'])
+@limiter.limit("20 per minute")
+def adjust_inventory():
+    err = admin_required()
+    if err: return err
+    d = request.get_json(silent=True) or {}
+    clean, err_msg = extract_whitelisted_fields(d, {'InventoryID', 'NewQuantity', 'Reason'})
+    if err_msg:
+        return jsonify({'error': err_msg, 'code': 400}), 400
+    inventory_id = str(clean.get('InventoryID') or '').strip()
+    reason = str(clean.get('Reason') or '').strip()
+    if not inventory_id or not reason:
+        return jsonify({'error': 'Thiếu InventoryID hoặc Reason', 'code': 400}), 400
+    if reason not in ADJUST_REASONS:
+        return jsonify({'error': 'Lý do điều chỉnh không hợp lệ', 'code': 400}), 400
+    try:
+        new_quantity = int(clean.get('NewQuantity'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Số lượng mới không hợp lệ', 'code': 400}), 400
+    if new_quantity < 0:
+        return jsonify({'error': 'Số lượng mới không được âm', 'code': 400}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.start_transaction()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT QuantityAvailable FROM inventory WHERE InventoryID=%s FOR UPDATE",
+            (inventory_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return jsonify({'error': 'Không tìm thấy bản ghi tồn kho', 'code': 404}), 404
+        old_quantity = int(row['QuantityAvailable'] or 0)
+        cursor.execute(
+            "UPDATE inventory SET QuantityAvailable=%s WHERE InventoryID=%s",
+            (new_quantity, inventory_id),
+        )
+        adjustment_id = write_inventory_adjustment(
+            cursor, inventory_id, old_quantity, new_quantity, reason
+        )
+        conn.commit()
+        return jsonify({
+            'message': 'Điều chỉnh tồn kho thành công',
+            'AdjustmentID': adjustment_id,
+            'OldQuantity': old_quantity,
+            'NewQuantity': new_quantity,
+        })
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 
 # ══════════════════════════════════════════════════════
@@ -1078,6 +1206,741 @@ def update_order_status(oid):
         if conn:
             conn.rollback()
         app.logger.error("Error updating order status (TOCTOU guard): %s", str(e))
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+# ══════════════════════════════════════════════════════
+#  PURCHASE REQUISITIONS
+# ══════════════════════════════════════════════════════
+
+@app.route('/api/purchase-requisitions', methods=['GET'])
+@limiter.limit("30 per minute")
+def get_purchase_requisitions():
+    err = admin_required()
+    if err: return err
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT pr.*, p.ProductName, p.UnitPrice, p.Unit
+        FROM purchase_requisitions pr
+        JOIN product p ON p.ProductID = pr.ProductID
+        ORDER BY pr.CreatedAt DESC, pr.PRID DESC
+    """)
+    data = cursor.fetchall()
+    for row in data:
+        if row.get('CreatedAt'):
+            row['CreatedAt'] = str(row['CreatedAt'])
+    cursor.close(); conn.close()
+    return jsonify(data)
+
+@app.route('/api/purchase-requisitions', methods=['POST'])
+@limiter.limit("10 per minute")
+def add_purchase_requisition():
+    err = admin_required()
+    if err: return err
+    d = request.get_json(silent=True) or {}
+    clean, err_msg = extract_whitelisted_fields(d, PR_ALLOWED_CREATE)
+    if err_msg:
+        return jsonify({'error': err_msg, 'code': 400}), 400
+    product_id = str(clean.get('ProductID') or '').strip()
+    if not product_id:
+        return jsonify({'error': 'Thiếu trường bắt buộc: ProductID', 'code': 400}), 400
+    try:
+        quantity = int(clean.get('Quantity'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Số lượng không hợp lệ', 'code': 400}), 400
+    if quantity < 1:
+        return jsonify({'error': 'Số lượng phải lớn hơn 0', 'code': 400}), 400
+    requested_by = str(clean.get('RequestedBy') or get_jwt().get('sub') or 'admin').strip()[:50]
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.start_transaction()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT 1 FROM product WHERE ProductID=%s", (product_id,))
+        if not cursor.fetchone():
+            conn.rollback()
+            return jsonify({'error': 'Sản phẩm không tồn tại', 'code': 400}), 400
+        prid = next_entity_id(cursor, 'PR', 'PR')
+        cursor.execute("""
+            INSERT INTO purchase_requisitions (PRID, ProductID, Quantity, RequestedBy, Status)
+            VALUES (%s, %s, %s, %s, 'Pending_Approval')
+        """, (prid, product_id, quantity, requested_by))
+        conn.commit()
+        return jsonify({'message': 'Đã tạo yêu cầu mua hàng', 'PRID': prid}), 201
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+@app.route('/api/purchase-requisitions/<prid>/status', methods=['PATCH'])
+@limiter.limit("20 per minute")
+def update_purchase_requisition_status(prid):
+    err = admin_required()
+    if err: return err
+    d = request.get_json(silent=True) or {}
+    extra_fields = set(d.keys()) - {'Status'}
+    if extra_fields:
+        return jsonify({'error': f'Phát hiện trường không được phép (Mass Assignment): {", ".join(sorted(extra_fields))}', 'code': 400}), 400
+    new_status = d.get('Status')
+    if new_status not in ('Approved', 'Rejected'):
+        return jsonify({'error': 'Trạng thái không hợp lệ (Approved/Rejected)', 'code': 400}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.start_transaction()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT Status FROM purchase_requisitions WHERE PRID=%s FOR UPDATE", (prid,))
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return jsonify({'error': 'Không tìm thấy yêu cầu mua hàng', 'code': 404}), 404
+        if row['Status'] not in ('Pending_Approval', 'Draft'):
+            conn.rollback()
+            return jsonify({'error': f'Không thể duyệt yêu cầu ở trạng thái {row["Status"]}', 'code': 409}), 409
+        cursor.execute("UPDATE purchase_requisitions SET Status=%s WHERE PRID=%s", (new_status, prid))
+        conn.commit()
+        return jsonify({'message': 'Cập nhật trạng thái yêu cầu mua hàng thành công'})
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+# ══════════════════════════════════════════════════════
+#  PURCHASE ORDERS
+# ══════════════════════════════════════════════════════
+
+@app.route('/api/purchase-orders', methods=['GET'])
+@limiter.limit("30 per minute")
+def get_purchase_orders():
+    err = admin_required()
+    if err: return err
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT po.*, s.SupplierName, p.ProductName, p.Unit, pr.RequestedBy
+        FROM purchase_orders po
+        JOIN supplier s ON s.SupplierID = po.SupplierID
+        JOIN product p ON p.ProductID = po.ProductID
+        LEFT JOIN purchase_requisitions pr ON pr.PRID = po.PRID
+        ORDER BY po.OrderDate DESC, po.POID DESC
+    """)
+    data = cursor.fetchall()
+    for row in data:
+        if row.get('OrderDate'):
+            row['OrderDate'] = str(row['OrderDate'])
+        if row.get('CreatedAt'):
+            row['CreatedAt'] = str(row['CreatedAt'])
+    cursor.close(); conn.close()
+    return jsonify(data)
+
+@app.route('/api/purchase-orders', methods=['POST'])
+@limiter.limit("10 per minute")
+def add_purchase_order():
+    err = admin_required()
+    if err: return err
+    d = request.get_json(silent=True) or {}
+    clean, err_msg = extract_whitelisted_fields(d, PO_ALLOWED_CREATE)
+    if err_msg:
+        return jsonify({'error': err_msg, 'code': 400}), 400
+
+    supplier_id = str(clean.get('SupplierID') or '').strip()
+    if not supplier_id:
+        return jsonify({'error': 'Thiếu trường bắt buộc: SupplierID', 'code': 400}), 400
+    try:
+        unit_price = float(clean.get('UnitPrice'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Đơn giá không hợp lệ', 'code': 400}), 400
+    if unit_price < 0:
+        return jsonify({'error': 'Đơn giá không được âm', 'code': 400}), 400
+
+    order_date = str(clean.get('OrderDate') or date.today().isoformat()).strip()
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', order_date):
+        return jsonify({'error': 'OrderDate không hợp lệ (YYYY-MM-DD)', 'code': 400}), 400
+
+    prid = str(clean.get('PRID') or '').strip()
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.start_transaction()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT 1 FROM supplier WHERE SupplierID=%s", (supplier_id,))
+        if not cursor.fetchone():
+            conn.rollback()
+            return jsonify({'error': 'Nhà cung cấp không tồn tại', 'code': 400}), 400
+
+        if prid:
+            cursor.execute("""
+                SELECT ProductID, Quantity, Status
+                FROM purchase_requisitions WHERE PRID=%s FOR UPDATE
+            """, (prid,))
+            pr = cursor.fetchone()
+            if not pr:
+                conn.rollback()
+                return jsonify({'error': 'Không tìm thấy yêu cầu mua hàng', 'code': 404}), 404
+            if pr['Status'] != 'Approved':
+                conn.rollback()
+                return jsonify({'error': 'Chỉ có thể tạo đơn mua từ yêu cầu đã duyệt', 'code': 409}), 409
+            product_id = pr['ProductID']
+            quantity = int(pr['Quantity'])
+            cursor.execute("""
+                SELECT POID FROM purchase_orders
+                WHERE PRID=%s AND Status IN ('Ordered','Received') LIMIT 1
+            """, (prid,))
+            if cursor.fetchone():
+                conn.rollback()
+                return jsonify({'error': 'Yêu cầu mua hàng này đã có đơn mua', 'code': 409}), 409
+        else:
+            product_id = str(clean.get('ProductID') or '').strip()
+            if not product_id:
+                conn.rollback()
+                return jsonify({'error': 'Thiếu trường bắt buộc: ProductID', 'code': 400}), 400
+            try:
+                quantity = int(clean.get('Quantity'))
+            except (TypeError, ValueError):
+                conn.rollback()
+                return jsonify({'error': 'Số lượng không hợp lệ', 'code': 400}), 400
+            if quantity < 1:
+                conn.rollback()
+                return jsonify({'error': 'Số lượng phải lớn hơn 0', 'code': 400}), 400
+            cursor.execute("SELECT 1 FROM product WHERE ProductID=%s", (product_id,))
+            if not cursor.fetchone():
+                conn.rollback()
+                return jsonify({'error': 'Sản phẩm không tồn tại', 'code': 400}), 400
+
+        total_amount = round(quantity * unit_price, 2)
+        poid = next_entity_id(cursor, 'PO', 'PO')
+        cursor.execute("""
+            INSERT INTO purchase_orders
+                (POID, PRID, SupplierID, ProductID, Quantity, UnitPrice, TotalAmount, Status, OrderDate)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'Ordered', %s)
+        """, (poid, prid or None, supplier_id, product_id, quantity, unit_price, total_amount, order_date))
+        conn.commit()
+        return jsonify({
+            'message': 'Đã tạo đơn mua hàng',
+            'POID': poid,
+            'TotalAmount': total_amount,
+        }), 201
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+@app.route('/api/purchase-orders/<poid>/receive', methods=['PATCH'])
+@limiter.limit("10 per minute")
+def receive_purchase_order(poid):
+    err = admin_required()
+    if err: return err
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.start_transaction()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM purchase_orders WHERE POID=%s FOR UPDATE", (poid,))
+        po = cursor.fetchone()
+        if not po:
+            conn.rollback()
+            return jsonify({'error': 'Không tìm thấy đơn mua hàng', 'code': 404}), 404
+        if po['Status'] == 'Received':
+            conn.commit()
+            return jsonify({'message': 'Đơn mua hàng đã được nhập kho trước đó', 'POID': poid})
+        if po['Status'] == 'Cancelled':
+            conn.rollback()
+            return jsonify({'error': 'Không thể nhận đơn mua đã hủy', 'code': 409}), 409
+
+        inventory = lock_inventory_for_product(cursor, po['ProductID'])
+        if not inventory:
+            conn.rollback()
+            return jsonify({'error': 'Sản phẩm chưa có bản ghi tồn kho. Vui lòng tạo tồn kho trước khi nhận hàng.', 'code': 409}), 409
+        old_quantity = int(inventory['QuantityAvailable'] or 0)
+        new_quantity = old_quantity + int(po['Quantity'])
+        cursor.execute("""
+            UPDATE inventory SET QuantityAvailable=%s WHERE InventoryID=%s
+        """, (new_quantity, inventory['InventoryID']))
+        adjustment_id = write_inventory_adjustment(
+            cursor, inventory['InventoryID'], old_quantity, new_quantity, 'Nhập thêm'
+        )
+        cursor.execute("UPDATE purchase_orders SET Status='Received' WHERE POID=%s", (poid,))
+        conn.commit()
+        return jsonify({
+            'message': 'Nhập kho thành công',
+            'POID': poid,
+            'InventoryID': inventory['InventoryID'],
+            'OldQuantity': old_quantity,
+            'NewQuantity': new_quantity,
+            'AdjustmentID': adjustment_id,
+        })
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+# ══════════════════════════════════════════════════════
+#  RETURN ORDERS
+# ══════════════════════════════════════════════════════
+
+@app.route('/api/returns', methods=['GET'])
+@limiter.limit("30 per minute")
+def get_returns():
+    claims = get_jwt()
+    role = claims.get('role')
+    cid = claims.get('customer_id')
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    base_sql = """
+        SELECT r.*, o.CustomerID, c.CustomerName, p.ProductName, p.Unit
+        FROM return_orders r
+        JOIN orders o ON o.OrderID = r.OriginalOrderID
+        LEFT JOIN customer c ON c.CustomerID = o.CustomerID
+        LEFT JOIN product p ON p.ProductID = r.ProductID
+    """
+    if role == 'admin':
+        cursor.execute(base_sql + " ORDER BY r.CreatedAt DESC, r.ReturnID DESC")
+    else:
+        cursor.execute(base_sql + " WHERE o.CustomerID=%s ORDER BY r.CreatedAt DESC, r.ReturnID DESC", (cid,))
+    data = cursor.fetchall()
+    for row in data:
+        if row.get('CreatedAt'):
+            row['CreatedAt'] = str(row['CreatedAt'])
+    cursor.close(); conn.close()
+    return jsonify(data)
+
+@app.route('/api/returns', methods=['POST'])
+@limiter.limit("10 per minute")
+def add_return_order():
+    claims = get_jwt()
+    role = claims.get('role')
+    cid = claims.get('customer_id')
+    d = request.get_json(silent=True) or {}
+    clean, err_msg = extract_whitelisted_fields(d, RETURN_ALLOWED_CREATE)
+    if err_msg:
+        return jsonify({'error': err_msg, 'code': 400}), 400
+    order_id = str(clean.get('OriginalOrderID') or '').strip()
+    reason = str(clean.get('Reason') or '').strip()
+    if not order_id or not reason:
+        return jsonify({'error': 'Thiếu OriginalOrderID hoặc Reason', 'code': 400}), 400
+    if len(reason) > 255:
+        return jsonify({'error': 'Lý do trả hàng tối đa 255 ký tự', 'code': 400}), 400
+    try:
+        quantity = int(clean.get('Quantity'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Số lượng trả hàng không hợp lệ', 'code': 400}), 400
+    if quantity < 1:
+        return jsonify({'error': 'Số lượng trả hàng phải lớn hơn 0', 'code': 400}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.start_transaction()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT OrderID, CustomerID, ProductID, Quantity, Status
+            FROM orders WHERE OrderID=%s FOR UPDATE
+        """, (order_id,))
+        order = cursor.fetchone()
+        if not order:
+            conn.rollback()
+            return jsonify({'error': 'Không tìm thấy đơn hàng gốc', 'code': 404}), 404
+        if role != 'admin' and (not cid or order['CustomerID'] != cid):
+            conn.rollback()
+            return jsonify({'error': 'Forbidden: Không có quyền trả đơn hàng này', 'code': 403}), 403
+        if order['Status'] != 'Accepted':
+            conn.rollback()
+            return jsonify({'error': 'Chỉ có thể yêu cầu trả hàng cho đơn đã duyệt', 'code': 409}), 409
+        if quantity > int(order['Quantity']):
+            conn.rollback()
+            return jsonify({'error': f'Số lượng trả vượt quá số lượng đơn ({order["Quantity"]})', 'code': 400}), 400
+
+        cursor.execute("""
+            SELECT Quantity FROM return_orders
+            WHERE OriginalOrderID=%s AND Status IN ('Pending','Approved') FOR UPDATE
+        """, (order_id,))
+        used = sum(int(r['Quantity']) for r in cursor.fetchall())
+        if used + quantity > int(order['Quantity']):
+            conn.rollback()
+            return jsonify({'error': f'Đã có {used} sản phẩm được yêu cầu trả cho đơn này', 'code': 409}), 409
+
+        return_id = next_entity_id(cursor, 'RTN', 'RTN')
+        cursor.execute("""
+            INSERT INTO return_orders
+                (ReturnID, OriginalOrderID, ProductID, Quantity, Reason, Status, RefundAmount)
+            VALUES (%s, %s, %s, %s, %s, 'Pending', 0)
+        """, (return_id, order_id, order['ProductID'], quantity, reason))
+        conn.commit()
+        return jsonify({'message': 'Đã tạo yêu cầu trả hàng', 'ReturnID': return_id}), 201
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+@app.route('/api/returns/<rid>/status', methods=['PATCH'])
+@limiter.limit("20 per minute")
+def update_return_status(rid):
+    err = admin_required()
+    if err: return err
+    d = request.get_json(silent=True) or {}
+    extra_fields = set(d.keys()) - {'Status'}
+    if extra_fields:
+        return jsonify({'error': f'Phát hiện trường không được phép (Mass Assignment): {", ".join(sorted(extra_fields))}', 'code': 400}), 400
+    new_status = d.get('Status')
+    if new_status not in ('Approved', 'Rejected'):
+        return jsonify({'error': 'Trạng thái không hợp lệ (Approved/Rejected)', 'code': 400}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.start_transaction()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM return_orders WHERE ReturnID=%s FOR UPDATE", (rid,))
+        ret = cursor.fetchone()
+        if not ret:
+            conn.rollback()
+            return jsonify({'error': 'Không tìm thấy yêu cầu trả hàng', 'code': 404}), 404
+        if ret['Status'] != 'Pending':
+            if ret['Status'] == new_status:
+                conn.commit()
+                return jsonify({'message': f'Yêu cầu trả hàng đã ở trạng thái {new_status}'})
+            conn.rollback()
+            return jsonify({'error': f'Yêu cầu trả hàng đã được xử lý ({ret["Status"]})', 'code': 409}), 409
+
+        refund_amount = 0.0
+        if new_status == 'Approved':
+            cursor.execute("""
+                SELECT OrderID, ProductID, Quantity, Bill, Status
+                FROM orders WHERE OrderID=%s FOR UPDATE
+            """, (ret['OriginalOrderID'],))
+            order = cursor.fetchone()
+            if not order:
+                conn.rollback()
+                return jsonify({'error': 'Không tìm thấy đơn hàng gốc', 'code': 404}), 404
+            cursor.execute("""
+                SELECT Quantity FROM return_orders
+                WHERE OriginalOrderID=%s AND Status='Approved' FOR UPDATE
+            """, (ret['OriginalOrderID'],))
+            approved_so_far = sum(int(r['Quantity']) for r in cursor.fetchall())
+            if approved_so_far + int(ret['Quantity']) > int(order['Quantity']):
+                conn.rollback()
+                return jsonify({'error': 'Tổng số lượng trả vượt quá số lượng đơn hàng', 'code': 409}), 409
+
+            inventory = lock_inventory_for_product(cursor, ret['ProductID'])
+            if not inventory:
+                conn.rollback()
+                return jsonify({'error': 'Sản phẩm chưa có bản ghi tồn kho để hoàn hàng', 'code': 409}), 409
+            old_quantity = int(inventory['QuantityAvailable'] or 0)
+            new_quantity = old_quantity + int(ret['Quantity'])
+            cursor.execute("""
+                UPDATE inventory SET QuantityAvailable=%s WHERE InventoryID=%s
+            """, (new_quantity, inventory['InventoryID']))
+            write_inventory_adjustment(
+                cursor, inventory['InventoryID'], old_quantity, new_quantity, 'Trả hàng'
+            )
+            if order['Status'] == 'Accepted' and int(order['Quantity']) > 0:
+                refund_amount = round(
+                    (float(order['Bill']) / int(order['Quantity'])) * int(ret['Quantity']), 2
+                )
+
+        cursor.execute("""
+            UPDATE return_orders SET Status=%s, RefundAmount=%s WHERE ReturnID=%s
+        """, (new_status, refund_amount, rid))
+        conn.commit()
+        return jsonify({
+            'message': 'Đã duyệt yêu cầu trả hàng' if new_status == 'Approved' else 'Đã từ chối yêu cầu trả hàng',
+            'ReturnID': rid,
+            'RefundAmount': refund_amount,
+        })
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+# ══════════════════════════════════════════════════════
+#  STOCKTAKE (CYCLE COUNT)
+# ══════════════════════════════════════════════════════
+
+@app.route('/api/stocktake-sessions', methods=['GET'])
+@limiter.limit("30 per minute")
+def get_stocktake_sessions():
+    err = admin_required()
+    if err: return err
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT s.*, w.WarehouseName,
+               (SELECT COUNT(*) FROM stocktake_items i WHERE i.SessionID = s.SessionID) AS ItemCount
+        FROM stocktake_sessions s
+        JOIN warehouse w ON w.WarehouseID = s.WarehouseID
+        ORDER BY s.CreatedAt DESC, s.SessionID DESC
+    """)
+    data = cursor.fetchall()
+    for row in data:
+        if row.get('CreatedAt'):
+            row['CreatedAt'] = str(row['CreatedAt'])
+    cursor.close(); conn.close()
+    return jsonify(data)
+
+@app.route('/api/stocktake-sessions', methods=['POST'])
+@limiter.limit("10 per minute")
+def create_stocktake_session():
+    err = admin_required()
+    if err: return err
+    d = request.get_json(silent=True) or {}
+    clean, err_msg = extract_whitelisted_fields(d, {'WarehouseID'})
+    if err_msg:
+        return jsonify({'error': err_msg, 'code': 400}), 400
+    warehouse_id = str(clean.get('WarehouseID') or '').strip()
+    if not warehouse_id:
+        return jsonify({'error': 'Thiếu WarehouseID', 'code': 400}), 400
+    created_by = str(get_jwt().get('sub') or 'admin').strip()[:50]
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.start_transaction()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT 1 FROM warehouse WHERE WarehouseID=%s", (warehouse_id,))
+        if not cursor.fetchone():
+            conn.rollback()
+            return jsonify({'error': 'Kho không tồn tại', 'code': 400}), 400
+        cursor.execute("""
+            SELECT InventoryID, ProductID, QuantityAvailable
+            FROM inventory WHERE WarehouseID=%s FOR UPDATE
+        """, (warehouse_id,))
+        rows = cursor.fetchall()
+        if not rows:
+            conn.rollback()
+            return jsonify({'error': 'Kho chưa có bản ghi tồn kho để kiểm kê', 'code': 400}), 400
+        session_id = next_entity_id(cursor, 'ST', 'ST')
+        cursor.execute("""
+            INSERT INTO stocktake_sessions (SessionID, WarehouseID, CreatedBy, Status)
+            VALUES (%s, %s, %s, 'Draft')
+        """, (session_id, warehouse_id, created_by))
+        for row in rows:
+            cursor.execute("""
+                INSERT INTO stocktake_items
+                    (SessionID, ProductID, SystemQuantity, ActualQuantity, Difference)
+                VALUES (%s, %s, %s, NULL, NULL)
+            """, (session_id, row['ProductID'], int(row['QuantityAvailable'] or 0)))
+        conn.commit()
+        return jsonify({
+            'message': 'Đã tạo phiên kiểm kê',
+            'SessionID': session_id,
+            'ItemCount': len(rows),
+        }), 201
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+@app.route('/api/stocktake-sessions/<sid>', methods=['GET'])
+@limiter.limit("30 per minute")
+def get_stocktake_session(sid):
+    err = admin_required()
+    if err: return err
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT s.*, w.WarehouseName
+        FROM stocktake_sessions s
+        JOIN warehouse w ON w.WarehouseID = s.WarehouseID
+        WHERE s.SessionID=%s
+    """, (sid,))
+    session = cursor.fetchone()
+    if not session:
+        cursor.close(); conn.close()
+        return jsonify({'error': 'Không tìm thấy phiên kiểm kê', 'code': 404}), 404
+    cursor.execute("""
+        SELECT i.*, p.ProductName, p.Unit
+        FROM stocktake_items i
+        JOIN product p ON p.ProductID = i.ProductID
+        WHERE i.SessionID=%s
+        ORDER BY p.ProductName
+    """, (sid,))
+    items = cursor.fetchall()
+    if session.get('CreatedAt'):
+        session['CreatedAt'] = str(session['CreatedAt'])
+    session['items'] = items
+    cursor.close(); conn.close()
+    return jsonify(session)
+
+@app.route('/api/stocktake-sessions/<sid>/items', methods=['PATCH'])
+@limiter.limit("30 per minute")
+def update_stocktake_items(sid):
+    err = admin_required()
+    if err: return err
+    d = request.get_json(silent=True) or {}
+    entries = d.get('Items') if isinstance(d.get('Items'), list) else [d]
+    if not entries:
+        return jsonify({'error': 'Thiếu dữ liệu kiểm kê', 'code': 400}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.start_transaction()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT Status FROM stocktake_sessions WHERE SessionID=%s FOR UPDATE", (sid,))
+        session = cursor.fetchone()
+        if not session:
+            conn.rollback()
+            return jsonify({'error': 'Không tìm thấy phiên kiểm kê', 'code': 404}), 404
+        if session['Status'] == 'Completed':
+            conn.rollback()
+            return jsonify({'error': 'Phiên kiểm kê đã hoàn tất, không thể sửa', 'code': 409}), 409
+
+        updated = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                conn.rollback()
+                return jsonify({'error': 'Dữ liệu kiểm kê không hợp lệ', 'code': 400}), 400
+            product_id = str(entry.get('ProductID') or '').strip()
+            if not product_id:
+                conn.rollback()
+                return jsonify({'error': 'Thiếu ProductID', 'code': 400}), 400
+            try:
+                actual_quantity = int(entry.get('ActualQuantity'))
+            except (TypeError, ValueError):
+                conn.rollback()
+                return jsonify({'error': f'ActualQuantity không hợp lệ cho {product_id}', 'code': 400}), 400
+            if actual_quantity < 0:
+                conn.rollback()
+                return jsonify({'error': 'Số lượng thực tế không được âm', 'code': 400}), 400
+            cursor.execute("""
+                UPDATE stocktake_items
+                SET ActualQuantity=%s, Difference=%s - SystemQuantity
+                WHERE SessionID=%s AND ProductID=%s
+            """, (actual_quantity, actual_quantity, sid, product_id))
+            if cursor.rowcount == 0:
+                conn.rollback()
+                return jsonify({'error': f'Sản phẩm {product_id} không thuộc phiên kiểm kê', 'code': 400}), 400
+            updated += 1
+
+        if session['Status'] == 'Draft':
+            cursor.execute("UPDATE stocktake_sessions SET Status='In_Progress' WHERE SessionID=%s", (sid,))
+        conn.commit()
+        return jsonify({'message': 'Đã cập nhật số lượng thực tế', 'Updated': updated})
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+@app.route('/api/stocktake-sessions/<sid>/complete', methods=['PATCH'])
+@limiter.limit("10 per minute")
+def complete_stocktake_session(sid):
+    err = admin_required()
+    if err: return err
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.start_transaction()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM stocktake_sessions WHERE SessionID=%s FOR UPDATE", (sid,))
+        session = cursor.fetchone()
+        if not session:
+            conn.rollback()
+            return jsonify({'error': 'Không tìm thấy phiên kiểm kê', 'code': 404}), 404
+        if session['Status'] == 'Completed':
+            conn.commit()
+            return jsonify({'message': 'Phiên kiểm kê đã hoàn tất trước đó', 'SessionID': sid, 'AdjustedCount': 0})
+
+        cursor.execute("""
+            SELECT * FROM stocktake_items WHERE SessionID=%s FOR UPDATE
+        """, (sid,))
+        items = cursor.fetchall()
+        if not items:
+            conn.rollback()
+            return jsonify({'error': 'Phiên kiểm kê không có sản phẩm', 'code': 400}), 400
+
+        adjusted = 0
+        skipped = 0
+        for item in items:
+            actual = item['ActualQuantity']
+            if actual is None:
+                actual = int(item['SystemQuantity'])
+            actual = int(actual)
+            if actual == int(item['SystemQuantity']):
+                continue
+            cursor.execute("""
+                SELECT InventoryID, QuantityAvailable
+                FROM inventory WHERE ProductID=%s AND WarehouseID=%s FOR UPDATE
+            """, (item['ProductID'], session['WarehouseID']))
+            inventory = cursor.fetchone()
+            if not inventory:
+                skipped += 1
+                continue
+            old_quantity = int(inventory['QuantityAvailable'] or 0)
+            cursor.execute("""
+                UPDATE inventory SET QuantityAvailable=%s WHERE InventoryID=%s
+            """, (actual, inventory['InventoryID']))
+            write_inventory_adjustment(
+                cursor, inventory['InventoryID'], old_quantity, actual, 'Kiểm kê'
+            )
+            adjusted += 1
+
+        cursor.execute("UPDATE stocktake_sessions SET Status='Completed' WHERE SessionID=%s", (sid,))
+        conn.commit()
+        return jsonify({
+            'message': 'Hoàn tất kiểm kê',
+            'SessionID': sid,
+            'AdjustedCount': adjusted,
+            'SkippedCount': skipped,
+        })
+    except Exception:
+        if conn:
+            conn.rollback()
         raise
     finally:
         if cursor:

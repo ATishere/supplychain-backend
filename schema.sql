@@ -16,6 +16,10 @@ CREATE TABLE supplier (
     Location        VARCHAR(150),
     TaxCode         VARCHAR(20)     DEFAULT NULL,
     Email           VARCHAR(100)    DEFAULT NULL,
+    Rating          INT             NOT NULL DEFAULT 5,
+    OnTimeRate      DECIMAL(5,2)    NOT NULL DEFAULT 100.00,
+    CHECK (Rating BETWEEN 1 AND 5),
+    CHECK (OnTimeRate >= 0 AND OnTimeRate <= 100),
     UNIQUE (Email)
 );
 
@@ -60,6 +64,19 @@ CREATE TABLE inventory (
     FOREIGN KEY (ProductID)   REFERENCES product(ProductID)
         ON DELETE CASCADE ON UPDATE CASCADE,
     FOREIGN KEY (WarehouseID) REFERENCES warehouse(WarehouseID)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE inventory_adjustments (
+    AdjustmentID    VARCHAR(10)     PRIMARY KEY,
+    InventoryID     VARCHAR(10)     NOT NULL,
+    OldQuantity     INT             NOT NULL,
+    NewQuantity     INT             NOT NULL,
+    Reason          VARCHAR(255)    NOT NULL,
+    CreatedAt       TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+    CHECK (OldQuantity >= 0),
+    CHECK (NewQuantity >= 0),
+    FOREIGN KEY (InventoryID) REFERENCES inventory(InventoryID)
         ON DELETE CASCADE ON UPDATE CASCADE
 );
 
@@ -113,12 +130,12 @@ CREATE TABLE order_id_sequence (
 --  SAMPLE DATA
 -- ============================================================
 
-INSERT INTO supplier (SupplierID, SupplierName, ContactNumber, Location, TaxCode, Email) VALUES
-('S001', 'Công ty TNHH Nông nghiệp Xanh',        '0281234567', 'KCN Tân Bình, TP. Hồ Chí Minh',  '0101234567', 'nongnghiepxanh@supplychain7vn.vn'),
-('S002', 'Công ty CP Thiết bị Công nghiệp Việt',  '0241234567', 'KCN Bắc Thăng Long, Hà Nội',     '0101234568', 'thietbicongnghiep@supplychain7vn.vn'),
-('S003', 'Công ty TNHH Logistics Miền Nam',       '0287654321', 'Cảng Cát Lái, TP. Hồ Chí Minh',  '0101234569', 'logisticsmiennam@supplychain7vn.vn'),
-('S004', 'Công ty CP Linh kiện Điện tử',          '0247654321', 'KCNC Hòa Lạc, Hà Nội',           '0101234570', 'linhkiendientu@supplychain7vn.vn'),
-('S005', 'Công ty TNHH Bao bì Sinh thái',         '0283456789', 'KCN VSIP, Bình Dương',           '0101234571', 'baobisinhthai@supplychain7vn.vn');
+INSERT INTO supplier (SupplierID, SupplierName, ContactNumber, Location, TaxCode, Email, Rating, OnTimeRate) VALUES
+('S001', 'Công ty TNHH Nông nghiệp Xanh',        '0281234567', 'KCN Tân Bình, TP. Hồ Chí Minh',  '0101234567', 'nongnghiepxanh@supplychain7vn.vn', 4, 98.50),
+('S002', 'Công ty CP Thiết bị Công nghiệp Việt',  '0241234567', 'KCN Bắc Thăng Long, Hà Nội',     '0101234568', 'thietbicongnghiep@supplychain7vn.vn', 5, 96.00),
+('S003', 'Công ty TNHH Logistics Miền Nam',       '0287654321', 'Cảng Cát Lái, TP. Hồ Chí Minh',  '0101234569', 'logisticsmiennam@supplychain7vn.vn', 3, 88.00),
+('S004', 'Công ty CP Linh kiện Điện tử',          '0247654321', 'KCNC Hòa Lạc, Hà Nội',           '0101234570', 'linhkiendientu@supplychain7vn.vn', 4, 92.50),
+('S005', 'Công ty TNHH Bao bì Sinh thái',         '0283456789', 'KCN VSIP, Bình Dương',           '0101234571', 'baobisinhthai@supplychain7vn.vn', 5, 99.00);
 
 INSERT INTO product (ProductID, ProductName, Category, UnitPrice, SupplierID, Unit, Origin) VALUES
 ('P001', 'Động cơ công nghiệp A4',  'Máy móc',     12500000.00, 'S002', 'Chiếc', 'Việt Nam'),
@@ -183,7 +200,109 @@ WHERE OrderID REGEXP '^ORD[0-9]+$'
 ON DUPLICATE KEY UPDATE next_value = GREATEST(next_value, VALUES(next_value));
 
 -- ─────────────────────────────────────────────────────────────
--- TABLE 7: user (JWT authentication)
+-- TABLE 7: purchase_requisitions (yêu cầu mua hàng)
+-- ─────────────────────────────────────────────────────────────
+CREATE TABLE purchase_requisitions (
+    PRID            VARCHAR(10)     PRIMARY KEY,
+    ProductID       VARCHAR(10)     NOT NULL,
+    Quantity        INT             NOT NULL,
+    RequestedBy     VARCHAR(50)     NOT NULL,
+    Status          VARCHAR(20)     NOT NULL DEFAULT 'Pending_Approval',
+    CreatedAt       TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+    CHECK (Quantity > 0),
+    CHECK (Status IN ('Draft', 'Pending_Approval', 'Approved', 'Rejected')),
+    FOREIGN KEY (ProductID) REFERENCES product(ProductID)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- ─────────────────────────────────────────────────────────────
+-- TABLE 8: purchase_orders (đơn mua hàng)
+-- ─────────────────────────────────────────────────────────────
+CREATE TABLE purchase_orders (
+    POID            VARCHAR(10)     PRIMARY KEY,
+    PRID            VARCHAR(10)     DEFAULT NULL,
+    SupplierID      VARCHAR(10)     NOT NULL,
+    ProductID       VARCHAR(10)     NOT NULL,
+    Quantity        INT             NOT NULL,
+    UnitPrice       DECIMAL(15,2)   NOT NULL,
+    TotalAmount     DECIMAL(15,2)   NOT NULL,
+    Status          VARCHAR(20)     NOT NULL DEFAULT 'Ordered',
+    OrderDate       DATE            NOT NULL,
+    CreatedAt       TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+    CHECK (Quantity > 0),
+    CHECK (UnitPrice >= 0),
+    CHECK (TotalAmount >= 0),
+    CHECK (Status IN ('Ordered', 'Received', 'Cancelled')),
+    FOREIGN KEY (PRID)       REFERENCES purchase_requisitions(PRID)
+        ON DELETE SET NULL ON UPDATE CASCADE,
+    FOREIGN KEY (SupplierID) REFERENCES supplier(SupplierID)
+        ON DELETE RESTRICT ON UPDATE CASCADE,
+    FOREIGN KEY (ProductID)  REFERENCES product(ProductID)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+-- ─────────────────────────────────────────────────────────────
+-- TABLE 9: return_orders (đơn trả hàng)
+-- ─────────────────────────────────────────────────────────────
+CREATE TABLE return_orders (
+    ReturnID        VARCHAR(10)     PRIMARY KEY,
+    OriginalOrderID VARCHAR(10)     NOT NULL,
+    ProductID       VARCHAR(10)     NOT NULL,
+    Quantity        INT             NOT NULL,
+    Reason          VARCHAR(255)    NOT NULL,
+    Status          VARCHAR(20)     NOT NULL DEFAULT 'Pending',
+    RefundAmount    DECIMAL(15,2)   NOT NULL DEFAULT 0.00,
+    CreatedAt       TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+    CHECK (Quantity > 0),
+    CHECK (RefundAmount >= 0),
+    CHECK (Status IN ('Pending', 'Approved', 'Rejected')),
+    FOREIGN KEY (OriginalOrderID) REFERENCES orders(OrderID)
+        ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (ProductID)       REFERENCES product(ProductID)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- ─────────────────────────────────────────────────────────────
+-- TABLE 10: stocktake_sessions (phiên kiểm kê)
+-- ─────────────────────────────────────────────────────────────
+CREATE TABLE stocktake_sessions (
+    SessionID       VARCHAR(10)     PRIMARY KEY,
+    WarehouseID     VARCHAR(10)     NOT NULL,
+    CreatedBy       VARCHAR(50)     NOT NULL,
+    Status          VARCHAR(20)     NOT NULL DEFAULT 'Draft',
+    CreatedAt       TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+    CHECK (Status IN ('Draft', 'In_Progress', 'Completed')),
+    FOREIGN KEY (WarehouseID) REFERENCES warehouse(WarehouseID)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE stocktake_items (
+    SessionID       VARCHAR(10)     NOT NULL,
+    ProductID       VARCHAR(10)     NOT NULL,
+    SystemQuantity  INT             NOT NULL,
+    ActualQuantity  INT             DEFAULT NULL,
+    Difference      INT             DEFAULT NULL,
+    PRIMARY KEY (SessionID, ProductID),
+    FOREIGN KEY (SessionID)  REFERENCES stocktake_sessions(SessionID)
+        ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (ProductID)  REFERENCES product(ProductID)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- ─────────────────────────────────────────────────────────────
+-- TABLE 11: entity_id_sequence (ID tuần tự cho chứng từ)
+-- ─────────────────────────────────────────────────────────────
+CREATE TABLE entity_id_sequence (
+    entity          VARCHAR(20)     PRIMARY KEY,
+    next_value      INT UNSIGNED    NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO entity_id_sequence (entity, next_value) VALUES
+('ADJ', 0), ('PR', 0), ('PO', 0), ('RTN', 0), ('ST', 0)
+ON DUPLICATE KEY UPDATE next_value = next_value;
+
+-- ─────────────────────────────────────────────────────────────
+-- TABLE 12: user (JWT authentication)
 -- ─────────────────────────────────────────────────────────────
 CREATE TABLE user (
     UserID          INT             PRIMARY KEY AUTO_INCREMENT,
