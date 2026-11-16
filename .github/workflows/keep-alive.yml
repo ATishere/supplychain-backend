@@ -1,0 +1,13 @@
+name: Keep Render Alive
+on:
+  schedule:
+    - cron: '*/14 * * * *'  # Chạy 14 phút một lần
+  workflow_dispatch:      # Cho phép bấm chạy thủ công
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Backend
+        run: |
+          curl -s -o /dev/null -w "%{http_code}" https://supplychain-backend-p0em.onrender.com
