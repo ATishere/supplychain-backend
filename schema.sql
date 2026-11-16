@@ -310,7 +310,8 @@ CREATE TABLE user (
     PasswordHash    VARCHAR(100)    NOT NULL,
     Role            VARCHAR(20)     NOT NULL DEFAULT 'customer',
     CustomerID      VARCHAR(10)     DEFAULT NULL,
-    CHECK (Role IN ('admin', 'customer')),
+    -- 4 role B2B (khớp app.py: admin / org_manager / org_staff / customer)
+    CONSTRAINT user_role_chk CHECK (Role IN ('admin', 'customer', 'org_manager', 'org_staff')),
     FOREIGN KEY (CustomerID) REFERENCES customer(CustomerID)
         ON DELETE CASCADE ON UPDATE CASCADE
 );
